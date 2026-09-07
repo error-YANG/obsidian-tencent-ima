@@ -1,9 +1,9 @@
 {
-  "id": "ima-push",
+  "id": "tencent-ima-sync",
   "name": "IMA 知识库同步",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "minAppVersion": "1.5.0",
-  "description": "通过 IMA 官方 OpenAPI 双向同步 Obsidian 笔记与 IMA 知识库：上传（远端被删自动补传、同名占用自动编号）+ 拉取（冲突绝不覆盖本地修改）。",
+  "description": "通过 IMA 官方 OpenAPI 双向同步 Obsidian 与腾讯 IMA 知识库：全类型文件上传/拉取（pdf/word/ppt/excel/图片/epub 等）、定时推送/定时拉取、远端被删自动补传、同名自动编号、冲突绝不覆盖本地。",
   "author": "杨宇轩",
   "isDesktopOnly": true
 }
