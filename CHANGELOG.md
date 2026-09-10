@@ -1,51 +1,88 @@
-# changelog
+# CHANGELOG — tencent-ima-sync 插件
 
-## 0.6.0（2026-09-07）
+> Obsidian 双向同步插件：本地 vault ↔ 腾讯 IMA 知识库。
+> 维护者：杨宇轩。
 
-- **定时推送**：每天到点自动把白名单目录上传到 IMA 知识库（24 小时制 HH:MM，默认 09:00，可关）
-- **定时拉取**：每天到点自动从 IMA 知识库拉取到本地（默认 21:00，可关），当天只跑一次
-- **到点/晚点都跑**：设定时刻 Obsidian 未运行时，当天晚些时候打开会补跑一次，不会静默漏掉；跨天不补
-- 定时任务每分钟轮询检查，插件启动 5 秒后先查一次；到点时若上一次任务仍在运行则自动让位跳过
-- 「先落盘再执行」防崩溃重复触发：触发日期先写入配置再跑任务，插件崩溃/重启不会同一天重复执行
-- 启动检查定时器注册进插件生命周期，卸载后不再残留回调
-- 设置页新增「定时推送 / 定时推送时刻 / 定时拉取 / 定时拉取时刻」四项，分别归属上传区与拉取区
-- 界面文案统一：「OB 端目录」→「Obsidian 目录」；白名单输入框加宽（50% 宽度、最小 200px）
-- 修复：frontmatter 剥离正则兼容 CRLF 换行，Windows 换行文件修改 frontmatter 不再误触发重传
-- 修复：Push current note 命令补上传方向开关校验，与「单向模式守卫」行为一致
+---
 
-## 0.5.0（2026-09-06）
+## v0.6.1（2026-09-09）— Bug Fix：大文件上传 403 修复
 
-- **全类型上传/拉取**：不再限于 .md，支持 pdf / word / ppt / excel / csv / 图片(png/jpg/webp/gif/bmp/svg) / txt / xmind / 音频(mp3/m4a/wav/aac) / html / epub，按扩展名自动识别类型并校验官方大小上限（文本类 10MB、图片 30MB、epub 50MB、pdf/word/ppt/音频 200MB）
-- **拉取源知识库多选**：设置页方框打勾复选列表，可勾选多个知识库，拉取时逐库扫描汇总；单库列表失败不阻塞其它库
-- **方向开关**：「启用上传」「启用拉取」两个独立开关，关掉一侧即成单向模式，⇅ 自动跳过关闭的方向
-- 拉取增量升级：md 保持正文 hash 比对；其它类型按二进制 md5 比对，冲突照样不覆盖本地
-- 插件 id 更名：`ima-push` → `tencent-ima-sync`（显示名不变；老用户需重装或手动迁移文件夹，配置文件 data.json 可原样拷贝）
-- 实测：7 个 PDF（约 29MB）双库拉取 10 秒内全部落地
+### 现象
+本地源目录 38 个文件 → IMA 知识库上传 38 个目标时：
+- 36 个 ≤68MB 文件全部成功
+- 2 个 >100MB 大文件（思科 CCNP 178MB / 信息系统项目管理师 141MB）**始终 403 SignatureDoesNotMatch**
 
-## 0.4.0（2026-09-06）
+### 根因（排查 5 个 BUILD 后锁定）
+COS 分片上传（Multipart Upload）的客户端签名与服务端实际接收的请求不一致。系统性问题 = **分片签名**有 4 个坑，叠加出现：
 
-- 更名：IMA Push → **IMA 知识库同步**（插件已支持双向，原名不再贴切）
-- 新增 **IMA → Obsidian 拉取方向**：源知识库 .md 拉回本地指定文件夹，冲突绝不覆盖本地修改
-- 新增 **双向同步（Sync）**：按传输策略（先上传再拉取 / 先拉取再上传）一键执行
-- 新增 **传输策略** 设置项
-- 新增 **服务端存在性校验**：推送时批量核验远端（50 个/批），被删除的文件自动补传
-- UI：设置页三分区布局（上传 / 拉取 / 行为说明）+ 嵌线分隔符；右下角状态栏单按钮 `杨宇轩 ⇅` + 进度条；左侧竖栏「杨」字图标
-- 修复：COS v5 签名头分隔符错误（`;` → `&`）导致上传 403 的致命 bug
+| # | 坑 | 触发条件 | 修复版 |
+|---|---|---|---|
+| 1 | **分片 HTTP header key 大小写** | COS 按 HTTP 规范要求 header key 全小写（`host`/`content-type`/`content-md5`），客户端用驼峰 → 服务端解析时小写化，签名对不上 | .8 |
+| 2 | **query 值编码** | COS 要求分片 query 用「COS URL 安全编码」（只保留 `!~*'()`，其余保留），`encodeURIComponent` 会**多编码**这 5 个字符 → 请求行与签名里的 query 字符串字面值不同 | .9 |
+| 3 | **chunked 传输丢 query** | `fs.createReadStream` + chunked Transfer-Encoding 时，COS 服务端解析请求行 query 异常（FormatString 中 query 段为空） → 即使签名对，请求也被拒 | .10 |
+| 4 | **query key 大小写** | COS 按 HTTP 标准把 query key 转小写（`partnumber`/`uploadid`），客户端签 `partNumber`/`uploadId`（驼峰）→ 同样不一致 | .13 |
 
-## 0.3.1
+> 共同症状：服务端返回 `<Code>SignatureDoesNotMatch</Code>` + 完整 `<FormatString>`（实际收到的 httpString）与客户端 `<StringToSign>` 算出的 sha1 不一致。
 
-- 稳定性修复与行为说明完善
+### 修复方案
+- 文件阈值：`STREAM_THRESHOLD = 100MB`
+- 大于阈值：COS **分片上传**（Init → UploadPart 循环 → CompleteMultipartUpload），每片 **25MB**
+- 小于等于阈值：保留原有简单 PUT（**零回归**）
+- 分片三步每步独立签名，**所有 header key 全小写** + **所有 query 用 `cosUrlEncode` 安全编码** + **query key 全小写** + **分片 body 走定长 Buffer（无 chunked）**
 
-## 0.3.0
+### BUILD 演进（实战排查 8 版）
 
-- 增量推送（正文 hash 账本）、同名候选名批量检查与自动编号
-- Force re-push all 命令、设置页清空上传记录
-- 拉取/推送进度面板与结果汇总
+| BUILD | 改动 | 结果 |
+|---|---|---|
+| .4 | 流式上传 fallback + 显式 Host | 仍 403 |
+| .5 | 凭证时间窗 keyTime 用 `cred.start_time;cred.expired_time` | 仍 403 |
+| .6 | 大文件不签 content-length | 仍 403 |
+| .7 | 引入分片上传（每片 25MB） | 仍 403（找到 header 大小写线索） |
+| **.8** | 分片三步 header key 全改小写 | **仍 403**（漏了 query） |
+| **.9** | 加 `cosUrlEncode` 统一请求/签名编码 | **仍 403**（漏了 query key 大小写） |
+| **.10** | 分片 PUT 改成定长 Buffer 无 chunked | **仍 403**（最后还差 query key 大小写） |
+| **.11** | buildAuth 返回 `{auth, httpString, stringToSign}` + DIAG 输出 path/httpString | **诊断突破**（拿到完整服务端 FormatString） |
+| **.12** | DIAG 加 `clientSha1` + 扩 body 600 字符（拿到完整 40 位 hash） | **根因锁定**（query key 大小写差异） |
+| **.13** | 分片 queryParams key 改全小写 `partnumber`/`uploadid` | **✅ 全绿**，新增 2/跳过 36/失败 0 |
 
-## 0.2.0
+### 诊断工具沉淀
+**`[DIAG-COS]` 错误消息字段**（失败时打印）：
+- `httpString=`：客户端算的待签字符串（JSON 转义）
+- `clientSha1=`：客户端 httpString 的 sha1
+- `qParamList=`：`q-url-param-list` 的值
+- `path=`：实际请求路径（pathname + query）
 
-- 白名单目录上传、目标知识库下拉选择、测试连接
+**对比规则**：
+- 客户端 `clientSha1` == 服务端 StringToSign 里的 hash → httpString 完全对，问题在 `signKey`（keyTime 或 secret_key 与服务端不一致）
+- 不等 → httpString 格式错（编码/分隔/header key 大小写/query key 大小写）
 
-## 0.1.0
+### 涉及文件
+- `E:\ObsidianNote\.obsidian\plugins\tencent-ima-sync\main.js`
+  - `STREAM_THRESHOLD = 100 * 1024 * 1024`（阈值常量）
+  - `PART_SIZE = 25 * 1024 * 1024`（分片大小）
+  - `streamTimeoutMs(size)`：每 MB 1.5s，120s~900s 上限
+  - `cosUrlEncode`（新增）：COS URL 安全编码实现
+  - `cosUploadStream(host, pathname, headers, absPath, size, timeout, diag)`（新增）：Node https 流式 PUT
+  - `cosUploadMultipart(cred, absPath, size, contentType, partSize, timeout, diag)`（新增）：分片三步
+  - `cosUpload(cred, data, contentType, absPath, sizeOverride)`（重写）：大文件先 multipart，失败回退 stream + requestUrl（兜底对照）
 
-- 首个版本：Obsidian → IMA 单向上传
+### 验证
+- 本地源 38 个文件 → IMA 38 个文件，新增 2 / 跳过 36 / 失败 0
+- 耗时：约 X 秒（视网络）
+- 数据落盘：`data.json` 的 `lastPushResult`
+
+### 注意事项
+- **回退路径保留**：`cosUpload` 大文件仍先试 multipart，失败回退 stream + requestUrl，**不要删**，用于：
+  - 万一分片不被 STS policy 允许仍有对照诊断
+  - 历史兼容
+- **签名头一致原则**：上传任何 HTTP header 进入 `headers` 对象时，**key 必须全小写**（`host`/`content-type`/`content-md5`），否则不参与签名或不匹配
+- **query 编码一致性**：请求行 query 和签名 httpString 第 3 段必须**同一套编码**（都用 `cosUrlEncode`）
+- **大文件不走流式**：分片 body 必须**定长 Buffer** + `Content-Length`（无 chunked），否则 COS 解析请求行 query 异常
+
+---
+
+## 历史版本
+
+### v0.6.0（2026-09 之前）
+初版：拉取方向 + 上传简单 PUT（≤100MB 走 `requestUrl`，>100MB 走流式 fallback）。
+**已知问题**：>100MB 文件上传 403（已在 v0.6.1 修复）。

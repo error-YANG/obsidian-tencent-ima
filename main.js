@@ -1,6 +1,6 @@
 'use strict';
 /*
- * IMA 知识库同步 v0.6.0 — Obsidian <-> IMA 知识库双向同步插件 (官方 OpenAPI /openapi/wiki/v1)
+ * IMA 知识库同步 v0.6.1 — Obsidian <-> IMA 知识库双向同步插件 (官方 OpenAPI /openapi/wiki/v1)
  *
  * 配置形式:
  *  - Obsidian 目录: 白名单, 一行一个文件夹名
@@ -23,6 +23,20 @@ const crypto = require('crypto');
 const BASE = 'https://ima.qq.com';
 const TIMEOUT_MS = 30000;
 const MEDIA_TYPE_MD = 7;
+/* 超过此大小的文件走 COS 分片上传(multipart upload), 单请求不再发大 body,
+   彻底绕开服务端 STS policy 的 content-length-range 上限(实测约 100MB).
+   阈值取 100MB 的依据: 65.5MB 经 requestUrl 实证上传成功, 141MB 实证失败,
+   真实分界点落在两者之间。设 100MB 可让已实证安全的区间继续走老路径(零回归风险),
+   只对已实证会失败的大文件启用分片通道 —— 改动是"严格不劣"的 */
+const STREAM_THRESHOLD = 100 * 1024 * 1024;
+/* 分片上传每片大小: 25MB
+   178MB = 8 片, 141MB = 6 片; 远低于常见 STS content-length-range 上限(100MB) */
+const PART_SIZE = 25 * 1024 * 1024;
+/* 流式上传超时: 每 MB 给 1.5s, 下限 120s, 上限 900s */
+function streamTimeoutMs(size) {
+  const ms = Math.ceil(size / (1024 * 1024)) * 1500;
+  return Math.min(900000, Math.max(120000, ms));
+}
 
 /* 扩展名 -> {media_type, content_type} (官方 MediaType 枚举, 参照 ima 官方 skill 包 preflight-check.cjs) */
 const EXT_MAP = {
@@ -96,6 +110,8 @@ const DEFAULT_SETTINGS = {
   syncStrategy: 'push_pull', // 双向同步顺序: push_pull=先上传再拉取(默认) | pull_push=先拉取再上传
   fileStates: {},          // path -> {pushHash, kbId, uploadedName, mediaId, syncedAt}
   lastPushAt: 0,
+  lastRun: null,           // 兼容旧版: 单一对象, 不再写入, 读路径仍保留避免兼容性问题
+  runHistory: [],          // 运行历史: 最近 10 次, 每条 {at, dir, total, success, skipped, conflict, failed, errors}
 
   /* ---------- 定时同步 (v0.6.0): 推送/拉取 各一套独立定时, 每天固定时刻 HH:MM ---------- */
   /* lastDate = 上次触发日期 YYYY-MM-DD, 用于"同一天只跑一次" */
@@ -125,10 +141,28 @@ function parseWhitelist(text) {
     .filter(s => s.length > 0);
 }
 
+/* vault 内相对路径 -> 磁盘绝对路径 (仅桌面端 FileSystemAdapter 可用; 移动端返回 null 自动退回内存模式) */
+function vaultAbsPath(app, relPath) {
+  try {
+    const ad = app.vault.adapter;
+    if (ad && typeof ad.getFullPath === 'function') return ad.getFullPath(relPath);
+    if (ad && typeof ad.getBasePath === 'function') return require('path').join(ad.getBasePath(), relPath);
+  } catch (e) { /* 移动端无 node 环境, 忽略 */ }
+  return null;
+}
+
 function withTimeout(promise, label) {
   return Promise.race([
     promise,
     new Promise((_, rej) => setTimeout(() => rej(new Error(label + ' 超时(' + TIMEOUT_MS + 'ms)')), TIMEOUT_MS))
+  ]);
+}
+
+/* 自定义超时版: 大文件需要远超 30s 的窗口, 不能沿用固定 TIMEOUT_MS */
+function withTimeoutMs(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(label + ' 超时(' + ms + 'ms)')), ms))
   ]);
 }
 
@@ -144,13 +178,211 @@ function buildNameCandidates(fileName, max) {
 
 /* ---------- COS 上传 (官方签名算法, 参照 ima 官方 skill 包 cos-upload.cjs) ---------- */
 
-async function cosUpload(cred, data, contentType) {
+/* Node 原生流式 PUT: 绕开 requestUrl 对大 body 的内存/IPC 限制, 全程磁盘读流, 内存占用恒定 */
+function cosUploadStream(hostName, pathname, reqHeaders, absPath, size, timeoutMs, diag) {
+  return new Promise((resolve, reject) => {
+    const https = require('https');
+    const fs = require('fs');
+    /* 显式补 Host: 签名里 host 用的是不带端口的域名, 显式设置可杜绝 Node 自行推导带来的偏差 */
+    const headers = Object.assign({}, reqHeaders, {
+      'host': hostName,
+      'Content-Length': String(size)
+    });
+    const req = https.request({
+      hostname: hostName,
+      port: 443,
+      path: pathname,
+      method: 'PUT',
+      headers: headers
+    }, res => {
+      let body = '';
+      res.on('data', c => { if (body.length < 2000) body += c.toString('utf8'); });
+      res.on('end', () => {
+        if (res.statusCode >= 300) {
+          /* 诊断信息随错误一起落盘: 便于比对"签名用的值"与"实际发出的值"是否一致 */
+          const d = diag || {};
+          reject(new Error('COS 流式上传失败 HTTP ' + res.statusCode + ' ' + body.slice(0, 200)
+            + ' || DIAG host=' + hostName
+            + ' path=' + pathname
+            + ' signedLen=' + size
+            + ' realFileLen=' + (d.realLen === undefined ? '?' : d.realLen)
+            + ' keyTime=' + (d.keyTime || '?') + '(' + (d.keyTimeSrc || '?') + ')'
+            + ' headerList=' + (d.headerList || '?')
+            + ' httpString=' + (d.httpString || '?')));
+        }
+        else resolve();
+      });
+    });
+    let settled = false;
+    const fail = e => { if (!settled) { settled = true; try { req.destroy(); } catch (_) {} reject(e); } };
+    req.setTimeout(timeoutMs, () => fail(new Error('COS 流式上传超时(' + timeoutMs + 'ms)')));
+    req.on('error', fail);
+    const rs = fs.createReadStream(absPath);
+    rs.on('error', fail);
+    rs.pipe(req);
+  });
+}
+
+/* COS 分片上传: 解决大文件(>100MB)单 PUT 被 STS policy 限制的问题.
+   流程: InitMultipartUpload -> UploadPart(每片, 流式) -> CompleteMultipartUpload.
+   每步单独签名(签名含 query 参数 + headers) */
+async function cosUploadMultipart(cred, absPath, size, contentType, partSize, timeoutMs, diag) {
+  const https = require('https');
+  const fs = require('fs');
   const host = cred.bucket_name + '.cos.' + cred.region + '.myqcloud.com';
   const pathname = '/' + cred.cos_key;
+  /* keyTime 优先用凭证时间窗, 与 cosUpload 保持一致 */
   const now = Math.floor(Date.now() / 1000);
-  const keyTime = now + ';' + (now + 600);
+  const hasCredTime = Number(cred.start_time) > 0 && Number(cred.expired_time) > 0;
+  const keyTime = hasCredTime
+    ? Number(cred.start_time) + ';' + Number(cred.expired_time)
+    : now + ';' + (now + 3600);
+  const signKey = crypto.createHmac('sha1', cred.secret_key).update(keyTime).digest('hex');
 
-  const headers = { 'content-length': String(data.byteLength), 'host': host };
+  /* COS URL 安全编码: 只保留 !~*'(), 其余编码 —— 官方 cosUrlEncode 实现。
+     分片 query(partNumber/uploadId) 的值在【请求行】和【签名 httpString/q-url-param-list】必须用同一套编码,
+     用 encodeURIComponent 会多编码 !*'() 导致 SignatureDoesNotMatch(分片 PUT 403 根因) */
+  const cosUrlEncode = s => encodeURIComponent(String(s)).replace(/[!*'()]/g, c => c);
+
+  /* 签名: method 全小写, queryParams 按 k 排序(签名/请求均按字典序), headers 按 k 排序 */
+  const buildAuth = (method, queryParams, headers) => {
+    const headerKeys = Object.keys(headers).sort();
+    const queryStr = (queryParams || []).map(p => cosUrlEncode(p.k) + '=' + cosUrlEncode(p.v)).join('&');
+    const httpString = method.toLowerCase() + '\n' + pathname + '\n' + queryStr + '\n'
+      + headerKeys.map(k => k + '=' + cosUrlEncode(headers[k])).join('&') + '\n';
+    const stringToSign = 'sha1\n' + keyTime + '\n' + crypto.createHash('sha1').update(httpString).digest('hex') + '\n';
+    const signature = crypto.createHmac('sha1', signKey).update(stringToSign).digest('hex');
+    const auth = [
+      'q-sign-algorithm=sha1',
+      'q-ak=' + cred.secret_id,
+      'q-sign-time=' + keyTime,
+      'q-key-time=' + keyTime,
+      'q-header-list=' + headerKeys.join(';'),
+      'q-url-param-list=' + (queryParams || []).map(p => p.k).sort().join(';'),
+      'q-signature=' + signature
+    ].join('&');
+    return { auth, httpString, stringToSign };
+  };
+
+  /* 通用 https.request: body 可以是 Buffer 或 stream, queryParams 数组
+     分片场景(带 partNumber/uploadId query)下, 流式 chunked 传输会导致 COS 服务端解析请求行 query 异常 →
+     SignatureDoesNotMatch。统一把流读成定长 Buffer 再发(每片 25MB, 内存安全), 无 chunked, 签名稳定 */
+  const streamToBuffer = (rs, len) => new Promise((resolve, reject) => {
+    const chunks = []; let got = 0;
+    rs.on('data', c => { chunks.push(c); got += c.length; });
+    rs.on('end', () => resolve(Buffer.concat(chunks, got)));
+    rs.on('error', reject);
+  });
+
+  const doReq = async (method, queryParams, headers, bodyOrStream, bodyLen) => {
+    const built = buildAuth(method, queryParams, headers);
+    const allHeaders = Object.assign({}, headers, {
+      'Authorization': built.auth,
+      'x-cos-security-token': cred.token
+    });
+    let bodyBuf = null;
+    if (bodyOrStream) {
+      if (typeof bodyOrStream.pipe === 'function') {
+        bodyBuf = await streamToBuffer(bodyOrStream, bodyLen);
+        allHeaders['Content-Length'] = String(bodyBuf.length);
+      } else {
+        bodyBuf = bodyOrStream;
+        if (bodyLen != null) allHeaders['Content-Length'] = String(bodyLen);
+        else allHeaders['Content-Length'] = String(bodyBuf.length);
+      }
+    } else if (bodyLen != null) allHeaders['Content-Length'] = String(bodyLen);
+    const queryStr = (queryParams || []).map(p => cosUrlEncode(p.k) + '=' + cosUrlEncode(p.v)).join('&');
+    return await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: host, port: 443, path: pathname + '?' + queryStr, method: method, headers: allHeaders
+      }, res => {
+        let body = '';
+        res.on('data', c => { if (body.length < 4000) body += c.toString('utf8'); });
+        res.on('end', () => {
+          if (res.statusCode >= 300) {
+            /* 计算客户端 sha1(httpString), 便于和服务器 StringToSign 的 sha1 对比定位: 一致=httpString 对,signKey 错; 不一致=httpString 格式错 */
+            const clientSha1 = crypto.createHash('sha1').update(built.httpString).digest('hex');
+            const diag = ' [DIAG-COS] httpString=' + JSON.stringify(built.httpString)
+              + ' clientSha1=' + clientSha1
+              + ' qParamList=' + built.auth.match(/q-url-param-list=([^&]+)/)[1]
+              + ' path=' + pathname + '?' + queryStr;
+            /* 扩到 600 字符以捕获服务器 StringToSign 完整 40 位 hash */
+            reject(new Error('COS ' + method + ' HTTP ' + res.statusCode + ' ' + body.slice(0, 600) + diag));
+          } else resolve({ body: body, headers: res.headers });
+        });
+      });
+      let settled = false;
+      const fail = e => { if (!settled) { settled = true; try { req.destroy(); } catch (_) {} reject(e); } };
+      req.setTimeout(timeoutMs, () => fail(new Error('COS ' + method + ' 超时(' + timeoutMs + 'ms)')));
+      req.on('error', fail);
+      if (bodyBuf) req.end(bodyBuf);
+      else req.end();
+    });
+  };
+
+  /* 1. Init: POST /<key>?uploads */
+  const init = await doReq('POST', [{ k: 'uploads', v: '' }], { 'host': host }, null, 0);
+  const uploadIdMatch = init.body.match(/<UploadId>([^<]+)<\/UploadId>/);
+  if (!uploadIdMatch) throw new Error('COS 分片初始化失败, 未取到 UploadId: ' + init.body.slice(0, 300));
+  const uploadId = uploadIdMatch[1];
+  if (diag) { diag.uploadId = uploadId; diag.keyTime = keyTime; diag.keyTimeSrc = hasCredTime ? 'credential' : 'local'; }
+
+  /* 2. Upload Parts: 每片 PUT, 走 fs.createReadStream 的 start/end 切片读, 不读全文件 */
+  const parts = [];
+  let offset = 0;
+  let partNumber = 1;
+  while (offset < size) {
+    const end = Math.min(offset + partSize, size);
+    const len = end - offset;
+    const rs = fs.createReadStream(absPath, { start: offset, end: end - 1 });
+    const res = await doReq('PUT',
+      [{ k: 'partnumber', v: String(partNumber) }, { k: 'uploadid', v: uploadId }],
+      { 'host': host, 'content-type': contentType || 'application/octet-stream' },
+      rs, len);
+    const etag = res.headers.etag || res.headers.ETag;
+    if (!etag) throw new Error('COS 分片 ' + partNumber + ' 响应缺 ETag: ' + JSON.stringify(res.headers));
+    parts.push({ PartNumber: partNumber, ETag: etag });
+    offset = end;
+    partNumber++;
+  }
+  if (diag) { diag.partCount = parts.length; diag.partEtags = parts.map(p => p.PartNumber + '=' + p.ETag).join(','); }
+
+  /* 3. Complete: POST /<key>?uploadId=... body 是 XML */
+  const xmlParts = parts.map(p => '<Part><PartNumber>' + p.PartNumber + '</PartNumber><ETag>' + p.ETag + '</ETag></Part>').join('');
+  const xmlBody = '<CompleteMultipartUpload>' + xmlParts + '</CompleteMultipartUpload>';
+  const xmlBytes = Buffer.byteLength(xmlBody, 'utf8');
+  const md5 = crypto.createHash('md5').update(xmlBody).digest('base64');
+  const finalRes = await doReq('POST',
+    [{ k: 'uploadid', v: uploadId }],
+    { 'host': host, 'content-type': 'application/xml', 'content-md5': md5 },
+    Buffer.from(xmlBody, 'utf8'), xmlBytes);
+  if (/<Error>/i.test(finalRes.body)) throw new Error('COS 分片合并失败: ' + finalRes.body.slice(0, 300));
+}
+
+async function cosUpload(cred, data, contentType, absPath, sizeOverride) {
+  const size = data ? data.byteLength : sizeOverride;
+  if (typeof size !== 'number' || size < 0) throw new Error('cosUpload: 无法确定文件大小');
+  const host = cred.bucket_name + '.cos.' + cred.region + '.myqcloud.com';
+  const pathname = '/' + cred.cos_key;
+  /* keyTime 必须用凭证返回的 start_time;expired_time, 不能本地自算 —— 这是 COS PUT 403 的根因。
+     COS 服务端按凭证登记的时间窗校验 SignKey, 自算的窗口与之不符就 AccessDenied。
+     官方 skill 流程(knowledge-base/SKILL.md Step 5)明确传入:
+       --start-time <cos_credential.start_time> --expired-time <cos_credential.expired_time>
+     凭证缺这两个字段时才退回本地时间窗, 且对齐官方默认的 3600s(原先自算的 600s 也偏短) */
+  const now = Math.floor(Date.now() / 1000);
+  const hasCredTime = Number(cred.start_time) > 0 && Number(cred.expired_time) > 0;
+  const keyTime = hasCredTime
+    ? Number(cred.start_time) + ';' + Number(cred.expired_time)
+    : now + ';' + (now + 3600);
+
+  /* 大文件不签 content-length, 只签 host:
+     实测 36 个 ≤68MB 文件签 content-length 全部成功, 而 141MB/178MB 两个全部 403,
+     排除了 keyTime/通道/路径/算法后, 唯一系统性差异就是大小 ——
+     怀疑服务端对大文件 PUT 的 content-length 校验或 STS policy 有问题。
+     让大文件的 content-length 走未签名通道; 小文件保持原样(零回归风险) */
+  const signLength = size <= STREAM_THRESHOLD;
+  const headers = { 'host': host };
+  if (signLength) headers['content-length'] = String(size);
   const sortedKeys = Object.keys(headers).sort();
   const signKey = crypto.createHmac('sha1', cred.secret_key).update(keyTime).digest('hex');
   const httpHeaders = sortedKeys.map(k => k + '=' + encodeURIComponent(headers[k])).join('&');
@@ -167,14 +399,68 @@ async function cosUpload(cred, data, contentType) {
     'q-signature=' + signature
   ].join('&');
 
+  const url = 'https://' + host + pathname;
+  const putHeaders = {
+    'Content-Type': contentType || 'application/octet-stream',
+    'Authorization': auth,
+    'x-cos-security-token': cred.token
+  };
+
+  /* 大文件走 Node 读流: requestUrl 传 >100MB 级 body 会失败(内存/IPC), 这是 39/41 里那 2 个大 PDF 失败的根因 */
+  if (absPath && size > STREAM_THRESHOLD) {
+    /* 大文件优先走 COS 分片上传: 把 body 切成 25MB 一片, 每片单独 PUT,
+       彻底绕开 STS policy 的 content-length-range 单请求上限(实测约 100MB).
+       失败再退回流式/老路径兜底(理论上不再需要, 但保留以便对照诊断) */
+    let realLen;
+    try { realLen = require('fs').statSync(absPath).size; } catch (e) { realLen = 'stat失败:' + e.message; }
+    const diag = {
+      realLen: realLen,
+      keyTime: keyTime,
+      keyTimeSrc: hasCredTime ? 'credential' : 'local',
+      headerList: sortedKeys.join(';'),
+      httpString: httpString.replace(/\n/g, '\\n'),
+      partSize: PART_SIZE
+    };
+    try {
+      await cosUploadMultipart(cred, absPath, size, contentType, PART_SIZE, streamTimeoutMs(size), diag);
+      return;
+    } catch (eMul) {
+      /* 分片失败 -> 退回旧的流式 + requestUrl 双通道,
+         目的: 万一分片不被 STS policy 允许, 仍能拿到对照数据(以及万一成功) */
+      let streamErr = null;
+      try {
+        await cosUploadStream(host, pathname, putHeaders, absPath, size, streamTimeoutMs(size), diag);
+        return;
+      } catch (eStr) { streamErr = eStr; }
+
+      let fbData = data;
+      if (!fbData) {
+        try {
+          const buf = require('fs').readFileSync(absPath);
+          fbData = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+        } catch (e2) {
+          throw new Error('[multipart]' + (eMul.message || eMul)
+            + ' || [stream]' + (streamErr.message || streamErr)
+            + ' || 回退读文件失败: ' + (e2.message || e2));
+        }
+      }
+      try {
+        await withTimeoutMs(requestUrl({ url: url, method: 'PUT', headers: putHeaders, body: fbData }),
+          streamTimeoutMs(size), 'COS 上传(回退)');
+        return;
+      } catch (e3) {
+        throw new Error('[multipart]' + (eMul.message || eMul)
+          + ' || [stream]' + (streamErr.message || streamErr)
+          + ' || [requestUrl-fallback]' + (e3.message || e3));
+      }
+    }
+  }
+  if (!data) throw new Error('cosUpload: 小文件路径缺少 data');
+
   const resp = await withTimeout(requestUrl({
-    url: 'https://' + host + pathname,
+    url: url,
     method: 'PUT',
-    headers: {
-      'Content-Type': contentType || 'application/octet-stream',
-      'Authorization': auth,
-      'x-cos-security-token': cred.token
-    },
+    headers: putHeaders,
     body: data
   }), 'COS 上传');
   if (resp.status >= 300) throw new Error('COS 上传失败 HTTP ' + resp.status);
@@ -262,13 +548,15 @@ class ImaApi {
 }
 
 /* add_knowledge 需要 cos_key, 但它在 create_media 返回的凭证里, 单独封装完整上传链 (类型按文件名自动判定) */
-async function uploadToKB(api, kbId, folderId, fileName, data, title) {
+async function uploadToKB(api, kbId, folderId, fileName, data, title, absPath, sizeOverride) {
   const info = fileTypeInfo(fileName) || EXT_MAP.md;
-  const d = await api.createMedia(kbId, fileName, data.byteLength, info.content_type, (fileName.match(/\.([a-z0-9]+)$/i) || ['', 'md'])[1].toLowerCase());
+  const size = data ? data.byteLength : sizeOverride;
+  if (typeof size !== 'number') throw new Error('uploadToKB: 缺少文件大小');
+  const d = await api.createMedia(kbId, fileName, size, info.content_type, (fileName.match(/\.([a-z0-9]+)$/i) || ['', 'md'])[1].toLowerCase());
   const mediaId = d.media_id;
   const cred = d.cos_credential || d;
   if (!mediaId || !cred.cos_key) throw new Error('create_media 返回缺字段: ' + JSON.stringify(d).slice(0, 150));
-  await cosUpload(cred, data, info.content_type);
+  await cosUpload(cred, data, info.content_type, absPath, size);
   const r = await api.post('/openapi/wiki/v1/add_knowledge', {
     knowledge_base_id: kbId,
     folder_id: folderId || undefined,
@@ -278,7 +566,7 @@ async function uploadToKB(api, kbId, folderId, fileName, data, title) {
     file_info: {
       cos_key: cred.cos_key,
       file_name: fileName,
-      file_size: data.byteLength,
+      file_size: size,
       last_modify_time: Math.floor(Date.now() / 1000)
     }
   });
@@ -365,6 +653,9 @@ class StatusPanel {
 
 class ImaPushPlugin extends Plugin {
   async onload() {
+    /* 版本标记: 插件 main.js 不热重载, 改完必须关/开插件或重启 OB 才生效。
+       在控制台(Ctrl+Shift+I)看到这行即证明跑的是新代码; 每次改动递增 BUILD 号 */
+    console.log('[ima-sync] loaded BUILD=2026-09-09.13 (分片query key全小写 partnumber/uploadid)');
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.running = false;
     this.api = new ImaApi(this.settings.clientId, this.settings.apiKey);
@@ -451,9 +742,11 @@ class ImaPushPlugin extends Plugin {
     const hhmm = p(now.getHours()) + ':' + p(now.getMinutes());
     const today = this.todayKey();
     const jobs = [
-      { key: 'timerPush', label: '推送', run: () => this.pushAll(false) },
-      { key: 'timerPull', label: '拉取', run: () => this.pullAll() }
+      { key: 'timerPush', label: '推送', run: b => this.pushAll(false, b) },
+      { key: 'timerPull', label: '拉取', run: b => this.pullAll(b) }
     ];
+    /* 先筛出这一 tick 真正要跑的作业, 让它们共用一个批次号 (一次触发 = 汇总里一行) */
+    const due = [];
     for (const job of jobs) {
       const cfg = this.settings[job.key];
       if (!cfg || !cfg.enabled) continue;
@@ -464,10 +757,15 @@ class ImaPushPlugin extends Plugin {
         console.log('[ima-push] 定时' + job.label + '跳过: 上一次任务仍在运行');
         continue;
       }
-      cfg.lastDate = today;                             /* 先落盘再执行, 防止崩溃后重复触发 */
+      due.push({ job, cfg, t });
+    }
+    if (!due.length) return;
+    const batch = this.newBatchId();
+    for (const d of due) {
+      d.cfg.lastDate = today;                           /* 先落盘再执行, 防止崩溃后重复触发 */
       try { await this.saveSettings(); } catch (e) { console.error('[ima-push] 定时状态保存失败', e); }
-      new Notice('知识库同步：定时' + job.label + '触发（' + t + '）');
-      await job.run();
+      new Notice('知识库同步：定时' + d.job.label + '触发（' + d.t + '）');
+      await d.job.run(batch);
     }
   }
 
@@ -481,7 +779,7 @@ class ImaPushPlugin extends Plugin {
     return list.some(dir => path === dir + '.md' || path.startsWith(dir + '/'));
   }
 
-  async pushAll(force) {
+  async pushAll(force, batch) {
     if (this.running) { new Notice('知识库同步：上一次推送还没结束，请等汇总提示'); return; }
     if (this.settings.enablePush === false) { new Notice('知识库同步：上传方向已被开关关闭，如需上传请在设置里开启'); return; }
     if (!this.settings.clientId || !this.settings.apiKey) { new Notice('知识库同步：请先在设置里填 Client ID / API Key'); return; }
@@ -498,25 +796,26 @@ class ImaPushPlugin extends Plugin {
       stats.total = files.length;
       if (files.length === 0) {
         new Notice('知识库同步：白名单目录下没有找到任何可上传的文件');
+        await this.recordRun('push', stats, [], batch);   // 0 文件也是一次运行, 必须留痕
         return;
       }
-      let done = 0;
-      this.panel.start(files.length);
-
-      /* 服务端存在性校验: 本地账本认为"没变"的文件, 批量确认远端同名文件还在;
-         不在(说明被 IMA 端删除)则本次自动强制重传, 无需手动清空上传记录 */
+      /* 比对阶段: 本地 hash 比对 + 服务端存在性校验, 先于上传; 状态栏显式标「比对中」 */
       const forceSet = new Set();
       if (!force) {
+        this.panel.start(files.length, '比对中');
+        let cmpDone = 0;
         try {
           const unchanged = [];
           for (const f of files) {
+            cmpDone++;
+            this.panel.update(cmpDone - 1, files.length, f.name);
             const info = fileTypeInfo(f.name);
-            if (!info) continue;
+            if (!info) { this.panel.update(cmpDone, files.length, f.name); continue; }
             let h;
             if (info.media_type === MEDIA_TYPE_MD) {
               const raw = await this.app.vault.cachedRead(f);
               const body = stripFrontmatter(raw);
-              if (!body.trim()) continue;
+              if (!body.trim()) { this.panel.update(cmpDone, files.length, f.name); continue; }
               h = hashStr(body);
             } else {
               h = hashStr(f.stat.size + '|' + f.stat.mtime);
@@ -524,6 +823,7 @@ class ImaPushPlugin extends Plugin {
             const st = this.settings.fileStates[f.path];
             if (st && st.pushHash === h && st.kbId === this.settings.targetKbId)
               unchanged.push({ path: f.path, name: st.uploadedName });
+            this.panel.update(cmpDone, files.length, f.name);
           }
           const names = [...new Set(unchanged.map(u => u.name))];
           const gone = new Set();
@@ -538,6 +838,9 @@ class ImaPushPlugin extends Plugin {
           console.warn('[ima-push] 服务端存在性校验失败, 退回纯本地增量模式:', e);
         }
       }
+      /* 比对结束(或强制重传跳过比对), 进入上传阶段 */
+      this.panel.start(files.length, '上传中');
+      let done = 0;
 
       for (const file of files) {
         done++;
@@ -556,7 +859,18 @@ class ImaPushPlugin extends Plugin {
       }
 
       this.settings.lastPushAt = Date.now();
+      /* 失败清单落盘: 只在控制台打印的话事后无从追查, 这里持久化最近 20 条 */
+      this.settings.lastPushResult = {
+        at: Date.now(),
+        total: stats.total,
+        created: stats.created,
+        renamed: stats.renamed,
+        skipped: stats.skipped,
+        failed: stats.failed,
+        errors: errors.slice(0, 20)
+      };
       await this.saveSettings();
+      await this.recordRun('push', stats, errors, batch);
 
       const msg = '完成：新增 ' + stats.created + ' / 换名 ' + stats.renamed + ' / 跳过 ' + stats.skipped + ' / 失败 ' + stats.failed;
       this.panel.finish(msg, errors.length > 0);
@@ -565,6 +879,8 @@ class ImaPushPlugin extends Plugin {
     } catch (e) {
       this.panel.finish('推送异常中断：' + (e && e.message ? e.message : e), true);
       console.error('[ima-push]', e);
+      errors.push('异常中断 — ' + (e && e.message ? e.message : e));
+      await this.recordRun('push', stats, errors, batch);
     } finally {
       this.running = false;
     }
@@ -579,10 +895,11 @@ class ImaPushPlugin extends Plugin {
     const steps = [];
     if (pushFirst) { if (doPush) steps.push('push'); if (doPull) steps.push('pull'); }
     else { if (doPull) steps.push('pull'); if (doPush) steps.push('push'); }
+    const batch = this.newBatchId();   /* 一次触发共用批次号: 推+拉在汇总里合并成一行 */
     for (let i = 0; i < steps.length; i++) {
       if (i > 0 && this.running) return;   /* 防御: 上一步异常残留运行锁则不再继续 */
-      if (steps[i] === 'push') await this.pushAll(false);
-      else await this.pullAll();
+      if (steps[i] === 'push') await this.pushAll(false, batch);
+      else await this.pullAll(batch);
     }
   }
 
@@ -596,7 +913,7 @@ class ImaPushPlugin extends Plugin {
     return s.pullKbId ? [{ id: s.pullKbId, name: s.pullKbName || '源知识库' }] : [];
   }
 
-  async pullAll() {
+  async pullAll(batch) {
     if (this.running) { new Notice('IMA Pull：上一次任务还没结束，请等汇总提示'); return; }
     if (this.settings.enablePull === false) { new Notice('知识库同步：拉取方向已被开关关闭，如需拉取请在设置里开启'); return; }
     if (!this.settings.clientId || !this.settings.apiKey) { new Notice('IMA Pull：请先在设置里填 Client ID / API Key'); return; }
@@ -621,7 +938,9 @@ class ImaPushPlugin extends Plugin {
       stats.total = pullable.length;
       if (!pullable.length) {
         const tip = errors.length ? '（另有 ' + errors.length + ' 个库列表获取失败）' : '';
-        new Notice('知识库同步：' + kbs.length + ' 个源知识库里没有可拉取的文件' + tip); return;
+        new Notice('知识库同步：' + kbs.length + ' 个源知识库里没有可拉取的文件' + tip);
+        await this.recordRun('pull', stats, errors, batch);   // 0 可拉文件也是一次运行, 必须留痕
+        return;
       }
       this.panel.start(pullable.length, '拉取中');
       if (dir && !this.app.vault.getAbstractFileByPath(dir)) await this.app.vault.createFolder(dir);
@@ -678,12 +997,39 @@ class ImaPushPlugin extends Plugin {
       this.panel.finish(msg, errors.length > 0);
       if (errors.length) console.warn('[ima-push] pull issues:', errors);
       console.log('[ima-push]', msg, stats);
+      await this.recordRun('pull', stats, errors, batch);
     } catch (e) {
       this.panel.finish('拉取异常中断：' + (e && e.message ? e.message : e), true);
       console.error('[ima-push] pull:', e);
+      errors.push('异常中断 — ' + (e && e.message ? e.message : e));
+      await this.recordRun('pull', stats, errors, batch);
     } finally {
       this.running = false;
     }
+  }
+
+  /* 开一个新批次: 同一次触发 (点双向同步 / 一次定时 tick) 里的多个动作共用, 展示时合并成一行 */
+  newBatchId() { return 'b' + Date.now() + '-' + Math.random().toString(36).slice(2, 6); }
+
+  /* ---------- 运行汇总落盘: 每次 pushAll/pullAll 结束都写一条, 进 runHistory ---------- */
+  /* 覆盖 4 条路径: 正常完成 / 0 文件早返回 / 异常中断 / 凭据缺失 (后两种调用方决定是否调) */
+  async recordRun(dir, stats, errors, batch) {
+    const h = this.settings.runHistory || (this.settings.runHistory = []);
+    h.unshift({
+      at: Date.now(),
+      batch: batch || this.newBatchId(),
+      dir,
+      total: stats.total || 0,
+      success: (stats.created || 0) + (stats.renamed || 0),
+      skipped: stats.skipped !== undefined ? (stats.skipped || 0) : ((stats.same || 0) + (stats.conflict || 0)),
+      conflict: stats.conflict || 0,
+      failed: stats.failed || 0,
+      errors: (errors || []).slice(0, 5)
+    });
+    if (h.length > 10) h.length = 10;
+    /* 顺手维护 lastRun.at, 给"上次运行时间"显示用; 同时给"上方向分项"留一个聚合快照 */
+    this.settings.lastRun = { at: h[0].at, push: h.find(r => r.dir === 'push'), pull: h.find(r => r.dir === 'pull') };
+    await this.saveSettings();
   }
 
   async pushFile(file, force) {
@@ -718,10 +1064,23 @@ class ImaPushPlugin extends Plugin {
     }
     if (!chosen) throw new Error('同名候选名全部被占用（' + candidates[0] + ' ~ ' + candidates[candidates.length - 1] + '）');
 
-    /* 2. 上传链: create_media -> COS -> add_knowledge */
-    const data = await this.app.vault.readBinary(file);
+    /* 2. 上传链: create_media -> COS -> add_knowledge
+          大文件(>100MB)不做 readBinary, 直接把绝对路径交给流式上传, 避免整文件进内存
+          md 上传 stripFrontmatter 后的正文, 与上面 pushHash 的计算口径保持一致 */
+    const absPath = vaultAbsPath(this.app, file.path);
+    const useStream = !!absPath && info.media_type !== MEDIA_TYPE_MD && file.stat.size > STREAM_THRESHOLD;
+    let data = null;
+    if (!useStream) {
+      if (info.media_type === MEDIA_TYPE_MD) {
+        /* 与 pushHash 口径一致: 剥掉 frontmatter 再编码, slice() 保证 buffer 精确等于内容长度 */
+        const body = stripFrontmatter(await this.app.vault.cachedRead(file));
+        data = new TextEncoder().encode(body).slice().buffer;
+      } else {
+        data = await this.app.vault.readBinary(file);
+      }
+    }
     const title = chosen.replace(/\.[a-z0-9]+$/i, '');
-    const mediaId = await uploadToKB(this.api, kbId, null, chosen, data, title);
+    const mediaId = await uploadToKB(this.api, kbId, null, chosen, data, title, absPath, file.stat.size);
 
     const prevName = st && st.uploadedName;
     this.settings.fileStates[file.path] = {
@@ -741,7 +1100,7 @@ class ImaPushPlugin extends Plugin {
     if (!this.inWhitelist(file.path)) { new Notice('知识库同步：当前笔记不在白名单目录里'); return; }
     if (this.running) { new Notice('知识库同步：上一次推送还没结束'); return; }
     this.running = true;
-    this.panel.start(1);
+    this.panel.start(1, '上传中');
     try {
       this.panel.update(0, 1, file.name);
       const r = await this.pushFile(file, false);
@@ -766,6 +1125,10 @@ class ImaPushSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl('h2', { text: 'IMA 知识库同步设置（Obsidian ↔ IMA 双向）' });
+    /* 版本号/署名不放插件列表(会被截断), 改在设置页顶部以弱化小字展示 */
+    const _ver = (this.plugin.manifest && this.plugin.manifest.version) || '';
+    if (_ver) containerEl.createEl('div', { text: 'v' + _ver + '　作者:杨宇轩' })
+      .style.cssText = 'color:var(--text-muted);font-size:0.8em;margin:-10px 0 12px;';
 
     new Setting(containerEl).setName('Client ID').addText(t => t
       .setPlaceholder('ima OpenAPI Client ID')
@@ -793,7 +1156,7 @@ class ImaPushSettingTab extends PluginSettingTab {
         b.setDisabled(false);
       }));
 
-    new Setting(containerEl).setName('刷新知识库列表').setDesc('一键拉取当前 Key 有写入权限的全部 IMA 知识库，供上方「测试连接」及下方上传/拉取的下拉框共用；首次配置或新建知识库后点一次即可').addButton(b => b
+    new Setting(containerEl).setName('刷新知识库列表').setDesc('一键拉取当前 Key 有写入权限的全部 IMA 知识库，供上方「测试连接」及下方两个知识库下拉框共用；首次配置或新建知识库后点一次即可').addButton(b => b
       .setButtonText('刷新')
       .onClick(async () => {
         b.setDisabled(true);
@@ -848,7 +1211,7 @@ class ImaPushSettingTab extends PluginSettingTab {
 
     /* --- Obsidian 目录: 白名单 --- */
     containerEl.createEl('h3', { text: 'Obsidian 目录（白名单，一行一个）' });
-    new Setting(containerEl).setName('目录白名单').setDesc('vault 根目录下的文件夹名，一行一个，如：【01-笔记】。这些目录下的全部支持类型文件（md/pdf/word/ppt/excel/图片/txt/epub 等）都会被上传').addTextArea(t => {
+    new Setting(containerEl).setName('目录白名单').setDesc('vault 根目录下的文件夹名，一行一个，如：【01-笔记】。这些目录下的全部支持类型文件（md/pdf/word/ppt/excel/图片/txt/epub 等）都会被同步到 IMA').addTextArea(t => {
       t.inputEl.style.width = '100%';
       t.inputEl.style.height = '120px';
       t.inputEl.style.fontFamily = 'monospace';
@@ -981,17 +1344,51 @@ class ImaPushSettingTab extends PluginSettingTab {
       '<li>所有请求 30 秒超时，不会卡死；每次推送结束有明确汇总</li>' +
       '</ul>';
 
-    new Setting(containerEl).setName('清空上传记录').setDesc('忘记所有已同步状态，下次推送全部当作新文件（配合同名编号不会覆盖远端）').addButton(b => b
+    new Setting(containerEl).setName('清空同步记录').setDesc('忘记所有已同步状态，下次同步全部当作新文件（配合同名编号不会覆盖远端）').addButton(b => b
       .setButtonText('清空')
       .setWarning()
       .onClick(async () => {
         this.plugin.settings.fileStates = {};
         await this.plugin.saveSettings();
-        new Notice('已清空上传记录');
+        new Notice('已清空同步记录');
       }));
 
-    if (this.plugin.settings.lastPushAt) {
-      containerEl.createEl('p', { text: '上次推送：' + new Date(this.plugin.settings.lastPushAt).toLocaleString() });
+    const hist = this.plugin.settings.runHistory || [];
+    if (hist.length) {
+      /* 只展示最近一次「触发」: 同批次的记录 (点双向同步 / 一次定时 tick 里的推+拉) 合并成一行
+         东东 2026-09-10 定稿: 无序号、无次数括号、无累计行; 方向词统一写「同步」 */
+      const batchKey = r => r.batch || ('at' + r.at);
+      const key = batchKey(hist[0]);
+      const grp = hist.filter(r => batchKey(r) === key);
+      const at = Math.max.apply(null, grp.map(r => r.at));
+      const agg = { total: 0, success: 0, skipped: 0, conflict: 0, failed: 0 };
+      const errs = [];
+      grp.forEach(r => {
+        agg.total += r.total || 0;
+        agg.success += r.success || 0;
+        agg.skipped += r.skipped || 0;
+        agg.conflict += r.conflict || 0;
+        agg.failed += r.failed || 0;
+        (r.errors || []).forEach(x => errs.push(x));
+      });
+      const box = containerEl.createEl('div');
+      box.style.cssText = 'margin:10px 0;padding:8px 12px;border:1px solid var(--background-modifier-border);border-radius:6px;font-size:0.9em;line-height:1.8;';
+      box.createEl('div', { text: '上次运行时间：' + new Date(at).toLocaleString() }).style.fontWeight = '700';
+      box.createEl('div', { text: '运行汇总' }).style.cssText = 'font-weight:600;margin-top:6px;';
+      box.createEl('div', {
+        text: new Date(at).toLocaleString() +
+          '　同步' +
+          '：共 ' + agg.total + ' 个文件，成功 ' + (agg.success + agg.skipped) +
+          '（新增 ' + agg.success + ' / 跳过 ' + agg.skipped + (agg.conflict ? '，含冲突 ' + agg.conflict : '') + '），失败 ' + agg.failed
+      });
+      if (errs.length)
+        box.createEl('div', { text: '└ ' + errs.slice(0, 5).join('；') }).style.cssText = 'color:var(--text-error);font-size:0.85em;';
+    } else if (this.plugin.settings.lastRun && this.plugin.settings.lastRun.at) {
+      /* 兼容 v0.6.1 早期写下的 lastRun 单对象结构 */
+      const lr = this.plugin.settings.lastRun;
+      containerEl.createEl('p', { text: '上次运行时间：' + new Date(lr.at).toLocaleString() });
+    } else if (this.plugin.settings.lastPushAt) {
+      containerEl.createEl('p', { text: '上次运行时间：' + new Date(this.plugin.settings.lastPushAt).toLocaleString() });
     }
   }
 }

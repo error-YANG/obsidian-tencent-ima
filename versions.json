@@ -1,9 +1,12 @@
 {
-  "0.1.0": "1.5.0",
-  "0.2.0": "1.5.0",
-  "0.3.0": "1.5.0",
-  "0.3.1": "1.5.0",
-  "0.4.0": "1.5.0",
-  "0.5.0": "1.5.0",
-  "0.6.0": "1.5.0"
+  "0.6.1": {
+    "minAppVersion": "1.5.0",
+    "description": "修复 >100MB 大文件上传 COS 403 SignatureDoesNotMatch（分片上传签名对齐）",
+    "author": "YangYuXuan"
+  },
+  "0.6.0": {
+    "minAppVersion": "1.5.0",
+    "description": "IMA 知识库双向同步：拉取 + 上传（简单 PUT）",
+    "author": "YangYuXuan"
+  }
 }
