@@ -8,7 +8,7 @@
 | 当前版本 | `0.7.0` |
 | 最低 Obsidian 版本 | `1.5.0` |
 | 平台 | 仅桌面端（Windows / macOS / Linux） |
-| 许可证 | MIT © 2026 杨宇轩 |
+| 许可证 | MIT © 2026 杨宇轩（YangYuXuan） |
 
 ## 功能
 
@@ -40,8 +40,8 @@
 
 ## 安装（手动）
 
-1. 下载 Release 里的 `tencent-ima-sync-0.7.0.zip`；
-2. 解压到 `<vault>/.obsidian/plugins/tencent-ima-sync/`，使该目录下**直接**是 `main.js`、`manifest.json`；
+1. 从 [Releases](https://github.com/error-YANG/obsidian-tencent-ima/releases) 下载最新版的 `main.js`、`manifest.json`、`versions.json`；
+2. 放进 `<vault>/.obsidian/plugins/tencent-ima-sync/`（目录名必须与插件 id 一致），使该目录下**直接**是 `main.js`、`manifest.json`；
 3. 重启 Obsidian → `设置 → 第三方插件` → 启用 **IMA知识库同步**。
 
 ## 配置
@@ -49,7 +49,7 @@
 1. 在腾讯 IMA 开放平台申请 OpenAPI 凭据，取得 **Client ID** 与 **API Key**；
 2. 插件设置里填入这两项，点「测试」（会验证凭据并顺带拉取知识库列表）；
 3. 在「同步规则」中添加规则：本地目录 + 目标知识库 + 方向（上传 / 拉取）；
-4. 点左侧 ribbon 的数据库图标，或命令面板执行 `Sync` 开始同步。
+4. 点左侧竖栏的「杨」图标（或右下角状态栏的 `杨 ⇅` 按钮），也可以在命令面板执行 `Sync` 开始同步。
 
 > ⚠️ **`data.json` 会明文保存 API Key。** 请勿把 vault（尤其 `.obsidian/` 目录）推送到公开仓库；本仓库的 `.gitignore` 已默认忽略 `data.json`。
 
@@ -97,3 +97,7 @@ node --check main.js          # 语法自检
 ## 免责声明
 
 本项目为非官方的第三方插件，与腾讯公司无隶属关系。使用 IMA OpenAPI 时请遵守腾讯的相关服务条款；同步前建议先备份 vault。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 杨宇轩（YangYuXuan）
