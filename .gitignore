@@ -1,4 +1,4 @@
-# 构建/依赖
+# 构建 / 依赖
 node_modules/
 npm-debug.log*
 yarn-error.log*
@@ -13,6 +13,9 @@ desktop.ini
 .idea/
 *.swp
 
-# 本地凭据与个人数据（绝不上传）
+# 本地凭据与个人数据（明文保存 API Key / Client ID，绝不上传）
 data.json
 *.local.json
+
+# 日志
+*.log
