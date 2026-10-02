@@ -1,9 +1,9 @@
 {
   "id": "tencent-ima-sync",
   "name": "IMA知识库同步",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "minAppVersion": "1.5.0",
-  "description": "通过IMA 官方 OpenAPI双向同步 Obsidian与腾讯 IMA知识库. (详见 readme.MD)",
-  "author": "YangYuXuan",
+  "description": "通过IMA 官方 OpenAPI双向同步 Obsidian与腾讯 IMA知识库.",
+  "author": "杨宇轩",
   "isDesktopOnly": true
 }
